@@ -4,106 +4,111 @@ from torch.nn import Sequential
 from torchvision import models
 from torch.autograd import Variable
 from torch.nn.utils.rnn import pack_padded_sequence
+from torchsummary import summary
 
-class CNN(nn.Module):
-    """Class to build new model including all but last layers"""
-    def __init__(self, output_dim=1000):
-        super(CNN, self).__init__()
-        # TODO: change with resnet152?
+class CNNEncoder(nn.Module):
+    def __init__(self):
+        super(CNNEncoder, self).__init__()
         pretrained_model = models.resnet34(pretrained=True)
-        self.resnet = Sequential(*list(pretrained_model.children())[:-1])
-        self.linear = nn.Linear(pretrained_model.fc.in_features, output_dim)
-        self.batchnorm = nn.BatchNorm1d(output_dim, momentum=0.01)
-        self.init_weights()
-
-    def init_weights(self):
-        # weight init, inspired by tutorial
-        self.linear.weight.data.normal_(0,0.02)
-        self.linear.bias.data.fill_(0)
+        self.resnet = Sequential(*list(pretrained_model.children())[:-2])
+        self.batchnorm = nn.BatchNorm2d(num_features=512,momentum=0.01)
 
     def forward(self, x):
         x = self.resnet(x)
-        x = Variable(x.data)
-        x = x.view(x.size(0), -1) # flatten
-        x = self.linear(x)
-
+        x = self.batchnorm(x)
+        x = torch.reshape(x,(-1,49,512))
         return x
 
+class AttentionModel(nn.Module):
+    def __init__(self,hidden_dim):
+        super(AttentionModel, self).__init__()
+        self.hidden_to_input = nn.Linear(hidden_dim,512)
+        self.inputs_to_e = nn.Linear(512,1)
+        self.relu = nn.ReLU()
+        self.softmax = nn.Softmax(dim=1)
 
-class RNN(torch.nn.Module):
-    """
-    Recurrent Neural Network for Text Generation.
-    To be used as part of an Encoder-Decoder network for Image Captioning.
-    """
-    __rec_units = {
-        'elman': nn.RNN, 'gru': nn.GRU, 'lstm': nn.LSTM }
+    def forward(self,encoded_image,hidden_input):
+        hidden_inp = self.hidden_to_input(hidden_input).unsqueeze(1)
+        sum_of_inp = self.relu(encoded_image + hidden_inp)
+        e = self.inputs_to_e(sum_of_inp).squeeze(2)
+        alpha = self.softmax(e)
 
-    def __init__(self, emb_size, hidden_size, vocab_size, num_layers=1, rec_unit='gru'):
-        """
-        Initializer
+        return alpha
 
-        :param embed_size: size of word embeddings
-        :param hidden_size: size of hidden state of the recurrent unit
-        :param vocab_size: size of the vocabulary (output of the network)
-        :param num_layers: number of recurrent layers (default=1)
-        :param rec_unit: type of recurrent unit (default=gru)
-        """
-        rec_unit = rec_unit.lower()
-        assert rec_unit in RNN.__rec_units, 'Specified recurrent unit is not available'
+class DecoderRNN(nn.Module):
+    def __init__(self,embedding_dim,hidden_dim,vocabulary_size):
+        super(DecoderRNN,self).__init__()
+        self.embedding_matrix = nn.Embedding(vocabulary_size,embedding_dim)
+        self.lstm_cell = nn.LSTMCell(embedding_dim+512,hidden_dim,bias=True)
+        self.L_o = nn.Linear(embedding_dim,vocabulary_size)
+        self.L_h = nn.Linear(hidden_dim,embedding_dim)
+        self.L_z = nn.Linear(512,embedding_dim)
+        self.init_c = nn.Linear(512,hidden_dim)
+        self.init_h = nn.Linear(512,hidden_dim)
+        self.beta = nn.Linear(hidden_dim,512)
+        self.sigmoid = nn.Sigmoid()
 
-        super(RNN, self).__init__()
-        self.embeddings = nn.Embedding(vocab_size, emb_size)
-        self.unit = RNN.__rec_units[rec_unit](emb_size, hidden_size, num_layers,
-                                                 batch_first=True)
-        self.linear = nn.Linear(hidden_size, vocab_size)
+        self.attention = AttentionModel(hidden_dim)
 
-    def forward(self, features, captions, lengths):
-        """
-        Forward pass through the network
+        self.hidden_dim = hidden_dim
+        self.embedding_dim = embedding_dim
+        self.vocabulary_size = vocabulary_size
+        self.init_weights()
 
-        :param features: features from CNN feature extractor
-        :param captions: encoded and padded (target) image captions
-        :param lengths: actual lengths of image captions
-        :returns: predicted distributions over the vocabulary
-        """
-        # embed tokens in vector space
-        embeddings = self.embeddings(captions)
+    def init_weights(self):
+        self.embedding_matrix.weight.data.uniform_(-0.1, 0.1)
 
-        # append image as first input
-        inputs = torch.cat((features.unsqueeze(1), embeddings), 1)
+    def init_hidden_variable(self,encoded_image):
+        mean_encoded_image = encoded_image.mean(1)
+        h = self.init_h(mean_encoded_image)
+        c = self.init_c(mean_encoded_image)
+        return h,c
 
-        # pack data (prepare it for pytorch model)
-        inputs_packed = pack_padded_sequence(inputs, lengths, batch_first=True)
+    def forward(self,features, captions, lengths):
+        h, c = self.init_hidden_variable(features)
+        embeddings = self.embedding_matrix(captions)
+        outputs = torch.zeros(features.size(0), max(lengths), self.vocabulary_size)
+        alphas = torch.zeros(features.size(0), max(lengths), 49)
 
-        # run data through recurrent network
-        hiddens, _ = self.unit(inputs_packed)
-        outputs = self.linear(hiddens[0])
+
+        zeros = torch.zeros(features.size(0),dtype=torch.long,device='cuda:0')
+        alpha = self.attention(features,h)
+        encoding_with_attention = (features * alpha.unsqueeze(2)).sum(dim=1)
+        gating_scalar = self.sigmoid(self.beta(h))
+        encoding_with_attention = encoding_with_attention*gating_scalar
+        h,c = self.lstm_cell(torch.cat([self.embedding_matrix(zeros),encoding_with_attention],dim=1),(h,c))
+        output = self.L_o(self.embedding_matrix(zeros)+self.L_h(h)+self.L_z(encoding_with_attention))
+        outputs[:, 0, :] = output
+        alphas[:, 0, :] = alpha
+
+        for t in range(1,max(lengths)):
+            batch_size = sum([l > t for l in lengths])
+            alpha = self.attention(features[:batch_size],h[:batch_size])
+            encoding_with_attention = (features[:batch_size] * alpha.unsqueeze(2)).sum(dim=1)
+            gating_scalar = self.sigmoid(self.beta(h[:batch_size]))
+            encoding_with_attention = encoding_with_attention*gating_scalar
+            h,c = self.lstm_cell(torch.cat([embeddings[:batch_size,t-1,:],encoding_with_attention],dim=1),(h[:batch_size],c[:batch_size]))
+            output = self.L_o(embeddings[:batch_size,t-1,:]+self.L_h(h[:batch_size])+self.L_z(encoding_with_attention))
+            outputs[:batch_size, t, :] = output
+            alphas[:batch_size, t, :] = alpha
+
+        outputs = pack_padded_sequence(outputs, lengths, batch_first=True)[0]
+        return outputs,alphas
+
+    def sample(self,features,max_length=25):
+        h, c = self.init_hidden_variable(features)
+        outputs = torch.zeros(features.size(0), max_length)
+        output = torch.zeros(features.size(0),dtype=torch.long,device='cuda:0')
+        embeddings = self.embedding_matrix
+
+        for t in range(max_length):
+            alpha = self.attention(features,h)
+            encoding_with_attention = (features * alpha.unsqueeze(2)).sum(dim=1)
+            gating_scalar = self.sigmoid(self.beta(h))
+            encoding_with_attention = encoding_with_attention*gating_scalar
+            h,c = self.lstm_cell(torch.cat([embeddings(output),encoding_with_attention],dim=1),(h,c))
+            output = self.L_o(embeddings(output)+self.L_h(h)+self.L_z(encoding_with_attention))
+            output = output.argmax(dim=1)
+            outputs[:,t] = output
+
         return outputs
-
-    def sample(self, features, max_len=25):
-        """
-        Sample from Recurrent network using greedy decoding
-
-        :param features: features from CNN feature extractor
-        :returns: predicted image captions
-        """
-        output_ids = []
-        states = None
-        inputs = features.unsqueeze(1)
-
-        for i in range(max_len):
-            # pass data through recurrent network
-            hiddens, states = self.unit(inputs, states)
-            outputs = self.linear(hiddens.squeeze(1))
-
-            # find maximal predictions
-            predicted = outputs.max(1)[1]
-
-            # append results from given step to global results
-            output_ids.append(predicted)
-
-            # prepare chosen words for next decoding step
-            inputs = self.embeddings(predicted)
-            inputs = inputs.unsqueeze(1)
-        output_ids = torch.stack(output_ids, 1)
-        return output_ids.squeeze()

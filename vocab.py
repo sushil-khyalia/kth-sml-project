@@ -38,7 +38,7 @@ class Vocabulary(object):
         return '<end>'
 
 
-def build_vocab(json='data/annotations/captions_train2017.json', threshold=4, max_words=15000):
+def build_vocab(json='data/annotations/captions_train2014.json', threshold=4, max_words=15000):
     """Build a simple vocabulary wrapper."""
     coco = COCO(json)
     counter = Counter()
@@ -96,11 +96,11 @@ def main(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--caption_path', type=str, 
+    parser.add_argument('--caption_path', type=str,
                         help='path for train annotation file')
     parser.add_argument('--vocab_path', type=str, default=path_to_vocab(),
                         help='path for saving vocabulary wrapper')
-    parser.add_argument('--threshold', type=int, default=4, 
+    parser.add_argument('--threshold', type=int, default=4,
                         help='minimum word count threshold')
     args = parser.parse_args()
     main(args)
